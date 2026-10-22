@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gesture AR Filters</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #1a1a2e;
+            color: #eaeaea;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            overflow: hidden;
+        }
+
+        h1 {
+            font-size: 1.4rem;
+            margin-bottom: 1rem;
+            color: #a78bfa;
+            letter-spacing: 0.02em;
+        }
+
+        .video-container {
+            position: relative;
+            width: 640px;
+            height: 480px;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+        }
+
+        video {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1);
+        }
+
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            transform: scaleX(-1);
+            pointer-events: none;
+        }
+
+        .hud {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(4px);
+            padding: 10px 16px;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            line-height: 1.6;
+            z-index: 10;
+            min-width: 180px;
+        }
+
+        .hud .label {
+            color: #888;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .hud .value {
+            color: #a78bfa;
+            font-weight: 600;
+        }
+
+        .hud .status-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+
+        .hud .status-dot.connected {
+            background: #4ade80;
+        }
+
+        .hud .status-dot.disconnected {
+            background: #f87171;
+        }
+
+        .footer {
+            margin-top: 1rem;
+            font-size: 0.8rem;
+            color: #555;
+        }
+
+        .footer span {
+            color: #a78bfa;
+        }
+    </style>
+</head>
+<body>
+    <h1>✨ Gesture AR Filters</h1>
+
+    <div class="video-container">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="overlay"></canvas>
+        <div class="hud">
+            <div>
+                <span class="status-dot" id="statusDot"></span>
+                <span id="connectionStatus">Connecting...</span>
+            </div>
+            <div style="margin-top: 6px;">
+                <span class="label">Gesture:</span>
+                <span class="value" id="gestureDisplay">none</span>
+            </div>
+            <div>
+                <span class="label">Filter:</span>
+                <span class="value" id="filterDisplay">none</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="footer">
+        Show a gesture: <span>✌️ Peace</span> · <span>👍 Thumbs Up</span> · <span>🤘 Rock</span> · <span>3️⃣ Three Fingers</span> · <span>🖐 Palm (clear)</span>
+    </div>
+
+    <script type="module">
+        import { HandLandmarker, FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21";
+
+        // DOM elements
+        const video = document.getElementById("webcam");
+        const canvas = document.getElementById("overlay");
+        const ctx = canvas.getContext("2d");
+        const gestureDisplay = document.getElementById("gestureDisplay");
+        const filterDisplay = document.getElementById("filterDisplay");
+        const statusDot = document.getElementById("statusDot");
+        const connectionStatus = document.getElementById("connectionStatus");
+
+        // State
+        let ws = null;
+        let handLandmarker = null;
+        let faceLandmarker = null;
+        let lastFrameTime = 0;
+        let currentPlacement = null;
+        let filterImages = {};
+        let pendingResponse = false;
+
+        // Pre-load filter overlay images
+        const FILTER_ASSETS = {
+            web_slinger: "/static/assets/web_slinger.png",
+            sunglasses: "/static/assets/sunglasses.png",
+            armor_visor: "/static/assets/armor_visor.png",
+            patriotic_mask: "/static/assets/patriotic_mask.png",
+        };
+
+        function loadFilterImages() {
+            for (const [name, src] of Object.entries(FILTER_ASSETS)) {
+                const img = new Image();
+                img.src = src;
+                filterImages[name] = img;
+            }
+        }
+
+        // Initialize MediaPipe
+        async function initMediaPipe() {
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm"
+            );
+
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
+                    delegate: "GPU",
+                },
+                runningMode: "VIDEO",
+                numHands: 1,
+            });
+
+            faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
+                    delegate: "GPU",
+                },
+                runningMode: "VIDEO",
+                numFaces: 1,
+                outputFaceBlendshapes: false,
+                outputFacialTransformationMatrixes: false,
+            });
+        }
+
+        // WebSocket connection
+        function connectWebSocket() {
+            const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                statusDot.classList.add("connected");
+                statusDot.classList.remove("disconnected");
+                connectionStatus.textContent = "Connected";
+            };
+
+            ws.onmessage = (event) => {
+                pendingResponse = false;
+                const data = JSON.parse(event.data);
+
+                // Update HUD
+                gestureDisplay.textContent = data.gesture || "none";
+                filterDisplay.textContent = data.filter_type || "none";
+
+                // Store placement for rendering
+                currentPlacement = data.placement;
+            };
+
+            ws.onclose = () => {
+                statusDot.classList.remove("connected");
+                statusDot.classList.add("disconnected");
+                connectionStatus.textContent = "Disconnected";
+                pendingResponse = false;
+                // Attempt reconnection after a delay
+                setTimeout(connectWebSocket, 2000);
+            };
+
+            ws.onerror = () => {
+                ws.close();
+            };
+        }
+
+        // Start webcam
+        async function startCamera() {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: { width: 640, height: 480, facingMode: "user" },
+                audio: false,
+            });
+            video.srcObject = stream;
+            await new Promise((resolve) => {
+                video.onloadedmetadata = resolve;
+            });
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+        }
+
+        // Process frame
+        function processFrame() {
+            if (!video.videoWidth || !video.videoHeight) {
+                requestAnimationFrame(processFrame);
+                return;
+            }
+
+            const now = performance.now();
+
+            // Detect hands
+            let handLandmarks = null;
+            if (handLandmarker) {
+                const handResult = handLandmarker.detectForVideo(video, now);
+                if (handResult.landmarks && handResult.landmarks.length > 0) {
+                    handLandmarks = handResult.landmarks[0].map(lm => [lm.x, lm.y, lm.z]);
+                }
+            }
+
+            // Detect face
+            let faceLandmarks = null;
+            if (faceLandmarker) {
+                const faceResult = faceLandmarker.detectForVideo(video, now);
+                if (faceResult.faceLandmarks && faceResult.faceLandmarks.length > 0) {
+                    faceLandmarks = faceResult.faceLandmarks[0].map(lm => [lm.x, lm.y, lm.z]);
+                }
+            }
+
+            // Send to server (throttle: only send if not waiting for a response)
+            if (ws && ws.readyState === WebSocket.OPEN && !pendingResponse) {
+                pendingResponse = true;
+                ws.send(JSON.stringify({
+                    hand_landmarks: handLandmarks,
+                    face_landmarks: faceLandmarks,
+                }));
+            }
+
+            // Draw overlay
+            drawOverlay();
+
+            requestAnimationFrame(processFrame);
+        }
+
+        // Draw filter overlay on canvas
+        function drawOverlay() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            if (!currentPlacement) return;
+
+            const filterType = currentPlacement.filter_type;
+            const img = filterImages[filterType];
+
+            if (!img || !img.complete || img.naturalWidth === 0) return;
+
+            // Convert normalized coordinates to pixels
+            const cx = currentPlacement.center_x * canvas.width;
+            const cy = currentPlacement.center_y * canvas.height;
+            const w = currentPlacement.width * canvas.width;
+            const h = currentPlacement.height * canvas.height;
+
+            const x = cx - w / 2;
+            const y = cy - h / 2;
+
+            ctx.drawImage(img, x, y, w, h);
+        }
+
+        // Main init
+        async function main() {
+            loadFilterImages();
+
+            try {
+                await startCamera();
+            } catch (err) {
+                connectionStatus.textContent = "Camera error: " + err.message;
+                statusDot.classList.add("disconnected");
+                return;
+            }
+
+            await initMediaPipe();
+            connectWebSocket();
+            requestAnimationFrame(processFrame);
+        }
+
+        main();
+    </script>
+</body>
+</html>
